@@ -7,28 +7,57 @@ import bodyParser from 'body-parser';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'client/dist')));
 
-// Database Setup
+const JWT_SECRET = process.env.JWT_SECRET || 'wellness_secret_key_2024';
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
 const db = new sqlite3.Database(':memory:');
 
 db.serialize(() => {
+  // Users table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT DEFAULT 'user',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Admin users table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS admin_users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT DEFAULT 'admin',
+      permissions TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
   // Conversations table
   db.run(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
+      user_id TEXT,
       type TEXT,
       messages TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -40,12 +69,17 @@ db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS tickets (
       id TEXT PRIMARY KEY,
+      user_id TEXT,
       customer_name TEXT,
       email TEXT,
       subject TEXT,
       message TEXT,
       status TEXT DEFAULT 'open',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      priority TEXT DEFAULT 'medium',
+      assigned_to TEXT,
+      response TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
@@ -53,6 +87,7 @@ db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS appointments (
       id TEXT PRIMARY KEY,
+      user_id TEXT,
       customer_name TEXT,
       email TEXT,
       phone TEXT,
@@ -61,258 +96,519 @@ db.serialize(() => {
       time TEXT,
       notes TEXT,
       status TEXT DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Analytics table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS analytics (
+      id TEXT PRIMARY KEY,
+      event_type TEXT,
+      user_id TEXT,
+      data TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Products table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS products (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT,
+      description TEXT,
+      price REAL,
+      stock INTEGER,
+      image_url TEXT,
+      active BOOLEAN DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Blog posts table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS blog_posts (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      slug TEXT UNIQUE,
+      content TEXT,
+      author_id TEXT,
+      category TEXT,
+      published BOOLEAN DEFAULT 0,
+      views INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 });
 
-// OpenAI Setup
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// ============== HELPER FUNCTIONS ==============
 
-const SYSTEM_PROMPT = `You are a helpful AI health and wellness assistant for Mosaic Wellness. 
-You assist customers with:
-1. Information about our wellness brands: Man Matters (men's health), Be Bodywise (women's health), Little Joys (children's wellness), Root Labs (Ayurveda)
-2. Product recommendations based on customer health concerns
-3. General wellness advice related to mental health, fitness, nutrition
-4. Answering questions about our services including therapy, coaching, and integrative care
-5. Helping with appointment booking and customer support
-
-Be empathetic, knowledgeable, and professional. If unsure, offer to connect with a human specialist.`;
-
-// ============== AI ASSISTANT ENDPOINTS ==============
-
-// Chat with AI Assistant
-app.post('/api/chat', async (req, res) => {
+const verifyToken = (token) => {
   try {
-    const { message, conversationId } = req.body;
-
-    // Get or create conversation
-    let convId = conversationId || uuidv4();
-    let messages = [{ role: 'system', content: SYSTEM_PROMPT }];
-
-    // Retrieve existing conversation
-    db.get('SELECT messages FROM conversations WHERE id = ?', [convId], async (err, row) => {
-      if (row) {
-        try {
-          messages = [...messages, ...JSON.parse(row.messages)];
-        } catch (e) {
-          console.error('Error parsing messages:', e);
-        }
-      }
-
-      // Add new message
-      messages.push({ role: 'user', content: message });
-
-      try {
-        // Call OpenAI API
-        const response = await openai.chat.completions.create({
-          model: 'gpt-3.5-turbo',
-          messages: messages.slice(-10), // Keep last 10 messages for context
-          temperature: 0.7,
-          max_tokens: 500,
-        });
-
-        const assistantMessage = response.choices[0].message.content;
-
-        // Save conversation
-        const conversationMessages = [
-          ...messages.filter(m => m.role !== 'system').slice(-9),
-          { role: 'user', content: message },
-          { role: 'assistant', content: assistantMessage },
-        ];
-
-        db.run(
-          'INSERT OR REPLACE INTO conversations (id, type, messages, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-          [convId, 'ai_chat', JSON.stringify(conversationMessages)],
-          (err) => {
-            if (err) console.error('DB Error:', err);
-          }
-        );
-
-        res.json({
-          conversationId: convId,
-          message: assistantMessage,
-          role: 'assistant',
-        });
-      } catch (error) {
-        console.error('OpenAI Error:', error);
-        res.status(500).json({ error: 'Failed to get AI response' });
-      }
-    });
+    return jwt.verify(token, JWT_SECRET);
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return null;
+  }
+};
+
+const authMiddleware = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  const decoded = verifyToken(token);
+  if (!decoded) return res.status(401).json({ error: 'Invalid token' });
+
+  req.user = decoded;
+  next();
+};
+
+const adminMiddleware = (req, res, next) => {
+  authMiddleware(req, res, () => {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+  });
+};
+
+function buildFallbackAssistantReply(message) {
+  const lower = message.toLowerCase();
+
+  if (lower.includes('stress') || lower.includes('anxiety') || lower.includes('mental')) {
+    return "Stress and anxiety can improve with structured routines, sleep support, therapy, and supportive habits. I recommend our Therapy & Counseling and Life Coaching services.";
+  }
+
+  if (lower.includes('product') || lower.includes('brand') || lower.includes('wellness')) {
+    return "Mosaic Wellness offers four core brands: Man Matters (men's health), Be Bodywise (women's wellness), Little Joys (children), and Root Labs (Ayurveda).";
+  }
+
+  if (lower.includes('therapy') || lower.includes('counseling')) {
+    return "We offer individual, family, couples, and group therapy sessions. You can book through the support section.";
+  }
+
+  if (lower.includes('book') || lower.includes('appointment')) {
+    return "You can book a consultation through the support section. Tell me your needs and I can help you choose the right service.";
+  }
+
+  return "Mosaic Wellness can help with wellness products, therapy, coaching, and lifestyle support. What's your concern?";
+}
+
+// ============== USER AUTHENTICATION ==============
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const userId = uuidv4();
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    db.run(
+      'INSERT INTO users (id, name, email, password_hash) VALUES (?, ?, ?, ?)',
+      [userId, name, email, passwordHash],
+      function (err) {
+        if (err) {
+          if (err.message.includes('UNIQUE')) {
+            return res.status(409).json({ error: 'Email already registered' });
+          }
+          return res.status(500).json({ error: 'Registration failed' });
+        }
+
+        const token = jwt.sign({ userId, email, role: 'user' }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ userId, name, email, token });
+      }
+    );
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Get conversation history
-app.get('/api/conversation/:id', (req, res) => {
-  const { id } = req.params;
-  db.get('SELECT messages FROM conversations WHERE id = ?', [id], (err, row) => {
-    if (err) {
-      res.status(500).json({ error: 'Database error' });
-      return;
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
     }
-    if (row) {
-      res.json({ messages: JSON.parse(row.messages) });
-    } else {
-      res.json({ messages: [] });
-    }
-  });
+
+    db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+      if (err || !user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const isValid = await bcrypt.compare(password, user.password_hash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({ userId: user.id, name: user.name, email: user.email, token });
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// ============== SUPPORT TICKET ENDPOINTS ==============
+// ============== ADMIN AUTHENTICATION ==============
 
-// Create support ticket
-app.post('/api/support/ticket', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    db.get('SELECT * FROM admin_users WHERE email = ?', [email], async (err, admin) => {
+      if (err || !admin) {
+        return res.status(401).json({ error: 'Invalid admin credentials' });
+      }
+
+      const isValid = await bcrypt.compare(password, admin.password_hash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Invalid admin credentials' });
+      }
+
+      const token = jwt.sign({ adminId: admin.id, email: admin.email, role: 'admin' }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({ adminId: admin.id, name: admin.name, email: admin.email, token });
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Create default admin if not exists (run once)
+app.post('/api/admin/init', (req, res) => {
+  const adminId = uuidv4();
+  const passwordHash = bcrypt.hashSync('admin123', 10);
+
+  db.run(
+    'INSERT OR IGNORE INTO admin_users (id, name, email, password_hash) VALUES (?, ?, ?, ?)',
+    [adminId, 'Admin', 'admin@mosaicwellness.in', passwordHash],
+    (err) => {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to initialize admin' });
+      }
+      res.json({ message: 'Admin initialized. Email: admin@mosaicwellness.in, Password: admin123' });
+    }
+  );
+});
+
+// ============== AI CHAT ==============
+
+app.post('/api/chat', authMiddleware, async (req, res) => {
+  try {
+    const { message, conversationId } = req.body;
+    const convId = conversationId || uuidv4();
+
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    // Log analytics
+    db.run('INSERT INTO analytics (id, event_type, user_id) VALUES (?, ?, ?)', [
+      uuidv4(),
+      'chat_message',
+      req.user.userId,
+    ]);
+
+    if (!openai) {
+      const fallback = buildFallbackAssistantReply(message);
+      const conversationMessages = [
+        { role: 'user', content: message },
+        { role: 'assistant', content: fallback },
+      ];
+
+      db.run(
+        'INSERT OR REPLACE INTO conversations (id, user_id, type, messages, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+        [convId, req.user.userId, 'ai_chat', JSON.stringify(conversationMessages)]
+      );
+
+      return res.json({
+        conversationId: convId,
+        message: fallback,
+        role: 'assistant',
+      });
+    }
+
+    db.get('SELECT messages FROM conversations WHERE id = ?', [convId], async (err, row) => {
+      let existingMessages = [];
+      if (!err && row && row.messages) {
+        try {
+          existingMessages = JSON.parse(row.messages);
+        } catch (e) {
+          existingMessages = [];
+        }
+      }
+
+      const chatHistory = existingMessages.slice(-8);
+      const payload = [
+        {
+          role: 'system',
+          content: 'You are Mosaic Wellness AI. Help with wellness products, therapy, coaching, appointments, and support.',
+        },
+        ...chatHistory,
+        { role: 'user', content: message },
+      ];
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: payload,
+        temperature: 0.7,
+        max_tokens: 500,
+      });
+
+      const assistantReply = response.choices[0].message.content;
+
+      const newConversationMessages = [
+        ...chatHistory,
+        { role: 'user', content: message },
+        { role: 'assistant', content: assistantReply },
+      ];
+
+      db.run(
+        'INSERT OR REPLACE INTO conversations (id, user_id, type, messages, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+        [convId, req.user.userId, 'ai_chat', JSON.stringify(newConversationMessages)]
+      );
+
+      res.json({
+        conversationId: convId,
+        message: assistantReply,
+        role: 'assistant',
+      });
+    });
+  } catch (error) {
+    console.error('Chat error:', error);
+    res.status(500).json({ error: 'Failed to process chat' });
+  }
+});
+
+// ============== SUPPORT TICKETS ==============
+
+app.post('/api/support/ticket', authMiddleware, (req, res) => {
   const { customerName, email, subject, message } = req.body;
   const ticketId = uuidv4();
 
   db.run(
-    'INSERT INTO tickets (id, customer_name, email, subject, message) VALUES (?, ?, ?, ?, ?)',
-    [ticketId, customerName, email, subject, message],
+    'INSERT INTO tickets (id, user_id, customer_name, email, subject, message) VALUES (?, ?, ?, ?, ?, ?)',
+    [ticketId, req.user.userId, customerName, email, subject, message],
     (err) => {
       if (err) {
-        res.status(500).json({ error: 'Failed to create ticket' });
-        return;
+        return res.status(500).json({ error: 'Failed to create ticket' });
       }
+
+      db.run('INSERT INTO analytics (id, event_type, user_id) VALUES (?, ?, ?)', [
+        uuidv4(),
+        'support_ticket',
+        req.user.userId,
+      ]);
+
       res.json({ ticketId, status: 'open', message: 'Ticket created successfully' });
     }
   );
 });
 
-// Get support tickets
-app.get('/api/support/tickets', (req, res) => {
-  db.all('SELECT * FROM tickets ORDER BY created_at DESC', (err, rows) => {
+app.get('/api/support/tickets', authMiddleware, (req, res) => {
+  db.all('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC', [req.user.userId], (err, rows) => {
     if (err) {
-      res.status(500).json({ error: 'Database error' });
-      return;
+      return res.status(500).json({ error: 'Database error' });
     }
     res.json(rows);
   });
 });
 
-// Update ticket status
-app.patch('/api/support/ticket/:id', (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
+// ============== APPOINTMENTS ==============
 
-  db.run('UPDATE tickets SET status = ? WHERE id = ?', [status, id], (err) => {
-    if (err) {
-      res.status(500).json({ error: 'Failed to update ticket' });
-      return;
-    }
-    res.json({ message: 'Ticket updated' });
-  });
-});
-
-// ============== APPOINTMENT ENDPOINTS ==============
-
-// Book appointment
-app.post('/api/appointments', (req, res) => {
+app.post('/api/appointments', authMiddleware, (req, res) => {
   const { customerName, email, phone, service, date, time, notes } = req.body;
   const appointmentId = uuidv4();
 
   db.run(
-    'INSERT INTO appointments (id, customer_name, email, phone, service, date, time, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [appointmentId, customerName, email, phone, service, date, time, notes],
+    'INSERT INTO appointments (id, user_id, customer_name, email, phone, service, date, time, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [appointmentId, req.user.userId, customerName, email, phone, service, date, time, notes],
     (err) => {
       if (err) {
-        res.status(500).json({ error: 'Failed to book appointment' });
-        return;
+        return res.status(500).json({ error: 'Failed to book appointment' });
       }
+
+      db.run('INSERT INTO analytics (id, event_type, user_id) VALUES (?, ?, ?)', [
+        uuidv4(),
+        'appointment_booked',
+        req.user.userId,
+      ]);
+
       res.json({ appointmentId, status: 'pending', message: 'Appointment booked successfully' });
     }
   );
 });
 
-// Get appointments
-app.get('/api/appointments', (req, res) => {
-  db.all('SELECT * FROM appointments ORDER BY date DESC', (err, rows) => {
+app.get('/api/appointments', authMiddleware, (req, res) => {
+  db.all('SELECT * FROM appointments WHERE user_id = ? ORDER BY date DESC', [req.user.userId], (err, rows) => {
     if (err) {
-      res.status(500).json({ error: 'Database error' });
-      return;
+      return res.status(500).json({ error: 'Database error' });
     }
     res.json(rows);
   });
 });
 
-// ============== PRODUCT DATA ==============
-
-app.get('/api/products', (req, res) => {
-  const products = [
-    {
-      id: 1,
-      name: 'Man Matters',
-      category: "Men's Health",
-      description: 'Complete men\'s wellness solutions including hair care, sexual wellness, fitness, and mental health.',
-      image: '👨‍⚕️',
-      features: ['Hair Loss Treatment', 'Sexual Wellness', 'Fitness Programs', 'Mental Health Support'],
-      launched: 2020,
-    },
-    {
-      id: 2,
-      name: 'Be Bodywise',
-      category: "Women's Health",
-      description: 'Science-backed wellness products for women addressing skin, hair, PCOS, and overall health.',
-      image: '👩‍⚕️',
-      features: ['Skin Care', 'Hair Solutions', 'PCOS Management', 'Women\'s Health'],
-      launched: 2021,
-    },
-    {
-      id: 3,
-      name: 'Little Joys',
-      category: "Children's Wellness",
-      description: 'Safe and effective wellness products for children, approved by parents and experts.',
-      image: '👶',
-      features: ['Nutrition', 'Immune Support', 'Growth', 'Development'],
-      launched: 2024,
-    },
-    {
-      id: 4,
-      name: 'Root Labs',
-      category: 'Ayurveda',
-      description: 'Authentic Indian Ayurvedic wellness solutions bringing ancient wisdom to modern health.',
-      image: '🌿',
-      features: ['Herbal Remedies', 'Holistic Healing', 'Prevention', 'Balance'],
-      launched: 2022,
-    },
-  ];
-  res.json(products);
-});
-
-// ============== SERVICES DATA ==============
+// ============== DATA ENDPOINTS ==============
 
 app.get('/api/services', (req, res) => {
   const services = [
     {
       id: 1,
-      name: 'Therapy & Counseling',
+      title: 'Therapy & Counseling',
       description: 'Individual, family, couples, and group counseling with licensed therapists.',
       icon: '💬',
     },
     {
       id: 2,
-      name: 'Life Coaching',
+      title: 'Life Coaching',
       description: 'Personalized coaching for personal and professional growth.',
       icon: '🎯',
     },
     {
       id: 3,
-      name: 'Classes & Support Groups',
-      description: 'Workshops on emotional regulation, relationships, anger management, and more.',
+      title: 'Classes & Support Groups',
+      description: 'Supportive group sessions covering relationships, emotional regulation, and resilience.',
       icon: '📚',
     },
     {
       id: 4,
-      name: 'Integrative Care',
-      description: 'Nutrition, yoga therapy, acupuncture, and lifestyle coaching.',
+      title: 'Integrative Care',
+      description: 'Nutrition, yoga therapy, acupuncture, and lifestyle coaching support.',
       icon: '🧘',
     },
   ];
   res.json(services);
+});
+
+app.get('/api/products', (req, res) => {
+  const products = [
+    {
+      name: 'Man Matters',
+      category: "Men's Wellness",
+      description: 'Hair care, sexual wellness, fitness, and mental wellbeing.',
+      icon: '👨‍⚕️',
+      features: ['Hair support', 'Fitness guidance', 'Sexual wellness', 'Mental wellbeing'],
+    },
+    {
+      name: 'Be Bodywise',
+      category: "Women's Wellness",
+      description: 'Evidence-based solutions for skin, hair, hormone health, and vitality.',
+      icon: '👩‍⚕️',
+      features: ['Skin care', 'Hair solutions', 'PCOS support', 'Women's wellness'],
+    },
+    {
+      name: 'Little Joys',
+      category: "Children's Wellness",
+      description: 'Expert-developed products for child growth, immunity, and routines.',
+      icon: '👶',
+      features: ['Immunity support', 'Growth care', 'Routine health', 'Child wellbeing'],
+    },
+    {
+      name: 'Root Labs',
+      category: 'Ayurveda',
+      description: 'Modern Ayurvedic remedies blending tradition with science.',
+      icon: '🌿',
+      features: ['Herbal care', 'Holistic support', 'Daily wellness', 'Balance'],
+    },
+  ];
+  res.json(products);
+});
+
+// ============== ADMIN ROUTES ==============
+
+app.get('/api/admin/dashboard', adminMiddleware, (req, res) => {
+  const stats = {
+    totalUsers: 0,
+    totalAppointments: 0,
+    openTickets: 0,
+    totalRevenue: 0,
+  };
+
+  db.all('SELECT COUNT(*) as count FROM users', (err, rows) => {
+    if (!err && rows.length) stats.totalUsers = rows[0].count;
+  });
+
+  db.all('SELECT COUNT(*) as count FROM appointments', (err, rows) => {
+    if (!err && rows.length) stats.totalAppointments = rows[0].count;
+  });
+
+  db.all("SELECT COUNT(*) as count FROM tickets WHERE status = 'open'", (err, rows) => {
+    if (!err && rows.length) stats.openTickets = rows[0].count;
+  });
+
+  setTimeout(() => res.json(stats), 100);
+});
+
+app.get('/api/admin/tickets', adminMiddleware, (req, res) => {
+  db.all('SELECT * FROM tickets ORDER BY created_at DESC LIMIT 100', (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(rows);
+  });
+});
+
+app.patch('/api/admin/ticket/:id', adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const { status, response, priority } = req.body;
+
+  db.run(
+    'UPDATE tickets SET status = ?, response = ?, priority = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+    [status, response, priority, id],
+    (err) => {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to update ticket' });
+      }
+      res.json({ message: 'Ticket updated' });
+    }
+  );
+});
+
+app.get('/api/admin/appointments', adminMiddleware, (req, res) => {
+  db.all('SELECT * FROM appointments ORDER BY date DESC LIMIT 100', (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(rows);
+  });
+});
+
+app.patch('/api/admin/appointment/:id', adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  db.run('UPDATE appointments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [status, id], (err) => {
+    if (err) {
+      return res.status(500).json({ error: 'Failed to update appointment' });
+    }
+    res.json({ message: 'Appointment updated' });
+  });
+});
+
+app.get('/api/admin/users', adminMiddleware, (req, res) => {
+  db.all('SELECT id, name, email, role, created_at FROM users ORDER BY created_at DESC LIMIT 100', (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(rows);
+  });
+});
+
+app.get('/api/admin/analytics', adminMiddleware, (req, res) => {
+  db.all(
+    'SELECT event_type, COUNT(*) as count FROM analytics GROUP BY event_type ORDER BY count DESC',
+    (err, rows) => {
+      if (err) {
+        return res.status(500).json({ error: 'Database error' });
+      }
+      res.json(rows);
+    }
+  );
 });
 
 // Serve React app
@@ -321,5 +617,6 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`🌿 Mosaic Wellness server running on http://localhost:${PORT}`);
+  console.log(`📊 Admin panel: http://localhost:${PORT}/admin`);
 });
